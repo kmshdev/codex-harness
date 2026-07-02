@@ -49,7 +49,7 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: codex-harness-${{ matrix.target }}
           path: dist/*.tar.gz
