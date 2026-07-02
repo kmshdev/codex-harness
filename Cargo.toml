@@ -1,0 +1,32 @@
+[package]
+name = "codex-harness"
+version = "0.1.0"
+edition = "2024"
+description = "Set up and audit Codex-ready harness documentation for repositories."
+license = "MIT"
+repository = "https://github.com/kmshdev/codex-harness"
+homepage = "https://github.com/kmshdev/codex-harness"
+readme = "README.md"
+keywords = ["codex", "cli", "documentation", "agents", "harness"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "src/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
