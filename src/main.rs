@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -215,7 +216,14 @@ struct CommandRun {
 struct TemplateCheck {
     ok: bool,
     stale_templates: Vec<String>,
+    findings: Vec<TemplateFinding>,
     message: String,
+}
+
+#[derive(Clone, Serialize)]
+struct TemplateFinding {
+    path: String,
+    reason: String,
 }
 
 struct CommandOutcome {
@@ -311,13 +319,13 @@ fn run(cli: &Cli, command_name: &str) -> Result<CommandOutcome> {
         Commands::Sop(sop) => run_sop(sop)?,
         Commands::Request(request) => run_request(request, cli.json)?,
     };
-    let should_fail = matches!(cli.command, Commands::Audit(_) | Commands::Validate(_))
-        && value
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .map(|exit_code| exit_code != 0)
-            .unwrap_or(false);
+    let should_fail = audit_command_should_fail(&cli.command, &value);
     Ok(CommandOutcome { value, should_fail })
+}
+
+fn audit_command_should_fail(command: &Commands, value: &Value) -> bool {
+    matches!(command, Commands::Audit(_) | Commands::Validate(_))
+        && value.get("exit_code").and_then(Value::as_i64) != Some(0)
 }
 
 fn print_human(value: &Value) {
@@ -497,28 +505,73 @@ fn run_external(command_name: &str, parts: Vec<PathBuf>, target: Option<&Path>) 
 
 fn check_for_stale_templates(target: &Path) -> Result<TemplateCheck> {
     let target = absolutize(target)?;
-    let stale_templates = template_files(PlanMode::WorkNotes)
+    let mut findings_by_path = BTreeMap::new();
+    let mut seen_paths = BTreeSet::new();
+    for file in template_files(PlanMode::WorkNotes)
         .into_iter()
         .chain(template_files(PlanMode::Tracked))
-        .filter_map(|file| match fs::read_to_string(target.join(file.path)) {
-            Ok(existing) if existing == file.content => Some(Ok(file.path.to_string())),
-            Ok(_) => None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => Some(Err(error).with_context(|| format!("read {}", file.path))),
-        })
-        .collect::<Result<Vec<_>>>()?;
+    {
+        if !seen_paths.insert(file.path) {
+            continue;
+        }
+        let existing = match fs::read_to_string(target.join(file.path)) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => bail!("read {}: {error}", file.path),
+        };
+        let reason = if existing == file.content {
+            Some("matches bundled starter template exactly")
+        } else if contains_unresolved_placeholder(&existing) {
+            Some("contains unresolved starter placeholder text")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            findings_by_path.insert(
+                file.path.to_string(),
+                TemplateFinding {
+                    path: file.path.to_string(),
+                    reason: reason.to_string(),
+                },
+            );
+        }
+    }
 
-    let ok = stale_templates.is_empty();
+    let findings = findings_by_path.into_values().collect::<Vec<_>>();
+    let stale_templates = findings
+        .iter()
+        .map(|finding| finding.path.clone())
+        .collect::<Vec<_>>();
+    let ok = findings.is_empty();
     Ok(TemplateCheck {
         ok,
         stale_templates,
+        findings,
         message: if ok {
             "No exact bundled starter templates found.".to_string()
         } else {
-            "Harness docs still match starter templates; replace placeholders with repo-specific facts, promote durable rules, or remove unused starter files."
+            "Harness docs still contain starter templates or unresolved placeholders; replace them with repo-specific facts, promote durable rules, or remove unused starter files."
                 .to_string()
         },
     })
+}
+
+fn contains_unresolved_placeholder(content: &str) -> bool {
+    content.contains("[`")
+        || content.contains("`]")
+        || content.contains("[describe")
+        || content.contains("[command")
+        || content.contains("[source of truth]")
+        || content.contains("[primary user]")
+        || content.contains("[rule]")
+        || content.contains("[area]")
+        || content.contains("[test, audit, review, incident]")
+        || content.contains("[when to revisit]")
+        || content.contains("[log, endpoint, UI state, metric]")
+        || content.contains("[flow]")
+        || content.contains("[signal]")
+        || content.contains("[step]")
+        || content.contains("[check]")
 }
 
 fn inspect_repo(target: &Path) -> Result<RepoInspection> {
@@ -1384,6 +1437,13 @@ mod tests {
         assert!(!check.ok);
         assert!(check.stale_templates.contains(&"AGENTS.md".to_string()));
         assert!(check.stale_templates.contains(&"docs/PLANS.md".to_string()));
+        assert_eq!(
+            check.stale_templates.len(),
+            check.stale_templates.iter().collect::<BTreeSet<_>>().len()
+        );
+        assert!(check.findings.iter().any(|finding| {
+            finding.path == "AGENTS.md" && finding.reason.contains("starter template")
+        }));
         assert!(check.message.contains("starter templates"));
     }
 
@@ -1430,6 +1490,29 @@ mod tests {
 
         assert!(check.ok);
         assert!(check.stale_templates.is_empty());
+        assert!(check.findings.is_empty());
+    }
+
+    #[test]
+    fn template_check_fails_when_docs_keep_unresolved_placeholders() {
+        let target = tempdir().expect("create temporary target");
+        fs::create_dir_all(target.path().join("docs")).expect("create docs");
+        fs::write(
+            target.path().join("docs/QUALITY_SCORE.md"),
+            "# Quality\n\n| Area | Score | Evidence | Next Trigger |\n| --- | --- | --- | --- |\n| `[area]` | A | custom evidence | custom trigger |\n",
+        )
+        .expect("write placeholder doc");
+
+        let check = check_for_stale_templates(target.path()).expect("check templates");
+
+        assert!(!check.ok);
+        assert!(
+            check
+                .findings
+                .iter()
+                .any(|finding| finding.path == "docs/QUALITY_SCORE.md"
+                    && finding.reason.contains("placeholder"))
+        );
     }
 
     #[test]
@@ -1471,6 +1554,23 @@ mod tests {
                 .iter()
                 .any(|path| path == "AGENTS.md")
         );
+    }
+
+    #[test]
+    fn audit_outcome_fails_unless_external_exit_code_is_zero() {
+        let cli = Cli {
+            json: true,
+            command: Commands::Audit(TargetArgs {
+                target: PathBuf::from("."),
+            }),
+        };
+        let success = json!({ "exit_code": 0 });
+        let failure = json!({ "exit_code": 1 });
+        let missing = json!({ "stdout": "terminated before exit code" });
+
+        assert!(!audit_command_should_fail(&cli.command, &success));
+        assert!(audit_command_should_fail(&cli.command, &failure));
+        assert!(audit_command_should_fail(&cli.command, &missing));
     }
 
     proptest! {

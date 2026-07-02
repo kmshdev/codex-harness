@@ -55,9 +55,10 @@ codex-harness --json sop show encode-knowledge-into-repo
 `audit` and `validate` are readiness gates. They also run an internal
 template-drift check because upstream structural audits can report high scores
 for docs that still contain starter text. If a target repo still contains exact
-bundled template docs, the command exits nonzero, the JSON envelope has
-`ok: false`, and `data.template_check.stale_templates` lists the files that must
-be customized, promoted, or removed.
+bundled template docs or unresolved placeholder markers, the command exits
+nonzero, the JSON envelope has `ok: false`, and
+`data.template_check.findings` lists the files that must be customized,
+promoted, or removed.
 
 ## JSON Policy
 
